@@ -1,6 +1,6 @@
 """
 Neural Runtime Engine — Pure NumPy Vectorized Deep Learning Tensor Framework
-Author: Listora AI Engineering Team
+Author: ClearSpark AI Engineering Team
 Platform: Mobile / Embedded Linux / Termux / Server Cross-Platform Compatible
 
 Provides hardware-portable forward inference and backpropagation primitives:

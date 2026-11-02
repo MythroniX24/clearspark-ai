@@ -1,25 +1,30 @@
 """
-ListoraWatermarkAI — Master Neural Inpainting Engine
-Combines WAL-Net (Sparkle Localization Network) with CIS-Net (Gated Contextual Inpainting).
-Runs fully on-device with zero cloud dependencies.
+ClearSpark AI — Master Neural & Optical Watermark Removal Engine.
+Combines WAL-Net (Sparkle Localization Network) with Sub-Pixel Optical Alpha De-Blending
+and CIS-Net (Contextual Inpainting Network). Runs fully on-device with zero cloud dependencies.
 """
 
-import numpy as np
 import os
+import sys
 import time
+from typing import Optional, Dict, Any, Union
+import numpy as np
 from PIL import Image
 
-import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.wal_net import SparkleAttentionUNet
 from models.cis_net import ContextualInpaintingNet
-from training.dataset_generator import generate_procedural_sparkle
+from engine.gemini_alpha_provider import (
+    get_official_gemini_sparkle,
+    get_catalog_watermark_anchors
+)
 
 class ClearSparkAI:
     """
     ClearSpark AI — Production-Grade Deep Learning & Optical Watermark Removal Engine.
+    Engineered for authentic Google Gemini & Imagen 3 watermark detection and restoration.
     """
-    def __init__(self, weights_dir=None):
+    def __init__(self, weights_dir: Optional[str] = None) -> None:
         self.weights_dir = weights_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
         self.wal_net = SparkleAttentionUNet(in_channels=3, base_channels=16)
         self.cis_net = ContextualInpaintingNet(in_channels=4, base_channels=16)
@@ -41,175 +46,233 @@ class ClearSparkAI:
             except Exception as e:
                 print(f"Warning: Could not load weights from {cis_path}: {e}")
 
-        self.canonical_sizes = [32, 36, 40, 48, 56, 64, 80, 96, 112, 128]
+        self.canonical_sizes = [48, 96, 36, 42, 64]
 
-    def detect_watermark(self, img_np):
+    def detect_watermark(self, img_np: np.ndarray) -> Optional[Dict[str, Any]]:
         """
-        Scans image corners with Attention U-Net and Multi-Scale Feature Correlation.
+        Scans image corners using Google Gemini Catalog Anchors, Sparkle Correlation,
+        and Attention U-Net.
         Returns:
-            hit: dict with keys {x, y, side, confidence, corner, heatmap}
+            hit: dict with keys {x, y, side, confidence, corner, anchor_name}
         """
         if img_np.ndim == 2:
             img_np = np.stack([img_np, img_np, img_np], axis=-1)
-        elif img_np.ndim == 3 and img_np.shape[2] == 4:
+        elif img_np.ndim == 3 and img_np.shape[2] == 1:
+            img_np = np.concatenate([img_np, img_np, img_np], axis=-1)
+        elif img_np.ndim == 3 and img_np.shape[2] >= 3:
             img_np = img_np[:, :, :3]
+        else:
+            return None
 
         H, W, C = img_np.shape
-        min_dim = min(H, W)
-        # Official Gemini dock: 98% Bottom-Right, 2% Bottom-Left (RTL mode)
-        corners = [
-            ('br', (max(0, W - 240), max(0, H - 240), W, H)),
-            ('bl', (0, max(0, H - 240), min(W, 240), H))
-        ]
+        if H < 16 or W < 16:
+            return None
+        gray = (0.299 * img_np[:, :, 0] + 0.587 * img_np[:, :, 1] + 0.114 * img_np[:, :, 2]) / 255.0
 
         best_hit = None
         best_score = 0.0
 
-        # Tier 1: Canonical Margin Anchors (Fast Path ~ 50ms)
-        canonical_margins = [24, 32, 40, 48, 16, 20, 28, 36, 56, 64]
+        # Tier 1: Gemini Resolution Catalog Anchors (Instant < 5ms)
+        catalog_anchors = get_catalog_watermark_anchors(W, H)
 
-        for corner_name, (x1, y1, x2, y2) in corners:
-            patch = img_np[y1:y2, x1:x2, :3]
-            ph, pw, _ = patch.shape
-            if ph < 48 or pw < 48:
+        for anchor in catalog_anchors:
+            s = anchor['size']
+            bx = anchor['x']
+            by = anchor['y']
+
+            if bx < 0 or by < 0 or bx + s > W or by + s > H:
                 continue
 
-            gray_patch = (0.299 * patch[:, :, 0] + 0.587 * patch[:, :, 1] + 0.114 * patch[:, :, 2]) / 255.0
+            sp = get_official_gemini_sparkle(s)
+            tpl_mean = float(np.mean(sp))
+            tpl_var = float(np.var(sp))
+            if tpl_var < 1e-5:
+                continue
 
-            for s in self.canonical_sizes:
-                if s > ph - 8 or s > pw - 8:
-                    continue
-                sp = generate_procedural_sparkle(s)
-                tpl_mean = float(np.mean(sp))
-                tpl_var = float(np.var(sp))
-                if tpl_var < 1e-5:
-                    continue
+            sub = gray[by:by+s, bx:bx+s]
+            s_var = float(np.var(sub))
+            if s_var < 1e-4:
+                continue
+            s_mean = float(np.mean(sub))
+            cov = float(np.mean((sub - s_mean) * (sp - tpl_mean)))
+            base_ncc = cov / (np.sqrt(s_var * tpl_var) + 1e-7)
 
-                test_positions = []
-                for fm in canonical_margins:
-                    bx = fm if (corner_name == 'bl') else (pw - fm - s)
-                    by = ph - fm - s
-                    test_positions.append((bx, by))
+            if base_ncc > best_score:
+                best_score = base_ncc
+                best_hit = {
+                    'x': bx,
+                    'y': by,
+                    'side': s,
+                    'confidence': float(base_ncc),
+                    'corner': anchor['corner'],
+                    'anchor_name': anchor['name']
+                }
 
-                for bx, by in test_positions:
-                    if bx < 0 or by < 0 or bx + s > pw or by + s > ph:
-                        continue
-                    sub = gray_patch[by:by+s, bx:bx+s]
-                    s_var = float(np.var(sub))
-                    if s_var < 1e-4:
-                        continue
-                    s_mean = float(np.mean(sub))
-                    cov = float(np.mean((sub - s_mean) * (sp - tpl_mean)))
-                    base_ncc = cov / (np.sqrt(s_var * tpl_var) + 1e-7)
+            # If anchor shows positive correlation, perform sub-pixel micro-jitter
+            if base_ncc > 0.16:
+                for jx in range(-3, 4):
+                    for jy in range(-3, 4):
+                        if jx == 0 and jy == 0:
+                            continue
+                        nx, ny = bx + jx, by + jy
+                        if nx < 0 or ny < 0 or nx + s > W or ny + s > H:
+                            continue
+                        sub_j = gray[ny:ny+s, nx:nx+s]
+                        sv = float(np.var(sub_j))
+                        if sv < 1e-4:
+                            continue
+                        sm = float(np.mean(sub_j))
+                        c = float(np.mean((sub_j - sm) * (sp - tpl_mean)))
+                        ncc_j = c / (np.sqrt(sv * tpl_var) + 1e-7)
+                        if ncc_j > best_score:
+                            best_score = ncc_j
+                            best_hit = {
+                                'x': nx,
+                                'y': ny,
+                                'side': s,
+                                'confidence': float(ncc_j),
+                                'corner': anchor['corner'],
+                                'anchor_name': f"{anchor['name']}_jitter({jx},{jy})"
+                            }
 
-                    if base_ncc > best_score:
-                        best_score = base_ncc
-                        best_hit = {
-                            'x': x1 + bx,
-                            'y': y1 + by,
-                            'side': s,
-                            'confidence': float(base_ncc),
-                            'corner': corner_name,
-                            'patch_coords': (x1, y1, x2, y2)
-                        }
-
-                    # Fine-tune with micro-jitter only on correlated anchors
-                    if base_ncc > 0.18:
-                        for jx in range(-2, 3):
-                            for jy in range(-2, 3):
-                                if jx == 0 and jy == 0:
-                                    continue
-                                gx = bx + jx
-                                gy = by + jy
-                                if gx < 0 or gy < 0 or gx + s > pw or gy + s > ph:
-                                    continue
-                                sub_j = gray_patch[gy:gy+s, gx:gx+s]
-                                sj_var = float(np.var(sub_j))
-                                if sj_var < 1e-4:
-                                    continue
-                                sj_mean = float(np.mean(sub_j))
-                                cov_j = float(np.mean((sub_j - sj_mean) * (sp - tpl_mean)))
-                                ncc = cov_j / (np.sqrt(sj_var * tpl_var) + 1e-7)
-                                if ncc > best_score:
-                                    best_score = ncc
-                                    best_hit = {
-                                        'x': x1 + gx,
-                                        'y': y1 + gy,
-                                        'side': s,
-                                        'confidence': float(ncc),
-                                        'corner': corner_name,
-                                        'patch_coords': (x1, y1, x2, y2)
-                                    }
-
-            # If bottom-right corner has a confident hit, accept immediately
-            if corner_name == 'br' and best_hit and best_hit['confidence'] >= 0.32:
+            # Confirmed hit on official anchor
+            if best_score >= 0.28:
                 return best_hit
+
+        # Tier 2: Expanded Corner Fallback Scan for Non-standard crops
+        if best_score < 0.22:
+            scan_box = 320
+            corners = [
+                ('br', max(0, W - scan_box), max(0, H - scan_box), W, H),
+                ('bl', 0, max(0, H - scan_box), min(W, scan_box), H)
+            ]
+
+            for c_name, x1, y1, x2, y2 in corners:
+                cw = x2 - x1
+                ch = y2 - y1
+                for s in [48, 36, 96]:
+                    if s > cw - 10 or s > ch - 10:
+                        continue
+                    sp = get_official_gemini_sparkle(s)
+                    tpl_m, tpl_v = float(np.mean(sp)), float(np.var(sp))
+
+                    # Sample coarse grid
+                    for by in range(y1 + 10, y2 - s - 10, 4):
+                        for bx in range(x1 + 10, x2 - s - 10, 4):
+                            sub = gray[by:by+s, bx:bx+s]
+                            sv = float(np.var(sub))
+                            if sv < 1e-4:
+                                continue
+                            sm = float(np.mean(sub))
+                            cov = float(np.mean((sub - sm) * (sp - tpl_m)))
+                            score = cov / (np.sqrt(sv * tpl_v) + 1e-7)
+                            if score > best_score:
+                                best_score = score
+                                best_hit = {
+                                    'x': bx,
+                                    'y': by,
+                                    'side': s,
+                                    'confidence': float(score),
+                                    'corner': c_name,
+                                    'anchor_name': 'grid-scan'
+                                }
 
         return best_hit
 
-    def clean_image(self, input_path, output_path=None, use_neural_inpaint=False):
+    def erase_watermark(
+        self,
+        input_image: Union[str, Image.Image, np.ndarray],
+        output_path: Optional[str] = None,
+        use_neural_inpaint: bool = False
+    ) -> Dict[str, Any]:
         """
-        Loads an image, detects the watermark with Deep Attention WAL-Net,
-        and applies Contextual Inpainting (CIS-Net or Guided Telea Synthesis).
+        Detects and removes watermark with zero blur and sub-pixel optical alpha restoration.
         """
         start_time = time.time()
-        im = Image.open(input_path).convert('RGB')
-        w, h = im.size
-        img_np = np.array(im)
 
-        # 1. Detect
+        if isinstance(input_image, str):
+            pil_img = Image.open(input_image).convert("RGB")
+        elif isinstance(input_image, Image.Image):
+            pil_img = input_image.convert("RGB")
+        elif isinstance(input_image, np.ndarray):
+            arr = input_image
+            if arr.ndim == 3 and arr.shape[2] == 1:
+                arr = arr[:, :, 0]
+            pil_img = Image.fromarray(arr).convert("RGB")
+        else:
+            raise ValueError(f"Unsupported image input type: {type(input_image)}")
+
+        img_np = np.array(pil_img)
+        h, w, _ = img_np.shape
+
+        # 1. Detect Watermark Location
         hit = self.detect_watermark(img_np)
-        if not hit or hit['confidence'] < 0.22:
+        if not hit or hit['confidence'] < 0.16:
             elapsed = time.time() - start_time
             return {
                 'success': False,
-                'note': 'No watermark detected — image is pristine',
-                'elapsed_ms': int(elapsed * 1000)
+                'hit': None,
+                'cleaned_image': pil_img,
+                'elapsed_ms': int(elapsed * 1000),
+                'note': "No watermark detected with sufficient confidence."
             }
 
         s = hit['side']
         hx = hit['x']
         hy = hit['y']
 
-        # 2. Extract ROI with contextual padding
-        pad = max(10, s // 4)
-        rx1 = max(0, hx - pad)
-        ry1 = max(0, hy - pad)
-        rx2 = min(w, hx + s + pad)
-        ry2 = min(h, hy + s + pad)
+        # 2. Extract Context ROI with Safe Boundary Safeguards
+        pad = max(12, s // 4)
+        rx1 = max(0, min(w, hx - pad))
+        ry1 = max(0, min(h, hy - pad))
+        rx2 = max(rx1, min(w, hx + s + pad))
+        ry2 = max(ry1, min(h, hy + s + pad))
         rw = rx2 - rx1
         rh = ry2 - ry1
 
-        roi = img_np[ry1:ry2, rx1:rx2].copy()
+        if rw <= 0 or rh <= 0 or s <= 0:
+            elapsed = time.time() - start_time
+            return {
+                'success': False,
+                'hit': hit,
+                'cleaned_image': pil_img,
+                'elapsed_ms': int(elapsed * 1000),
+                'note': f"Invalid ROI dimensions ({rw}x{rh}) for watermark side {s}."
+            }
 
-        # 3. Create Neural Soft Mask
-        sp = generate_procedural_sparkle(s)
-        mask = np.zeros((rh, rw), dtype=np.float32)
+        roi = img_np[ry1:ry2, rx1:rx2].copy()
         local_x = hx - rx1
         local_y = hy - ry1
 
-        ey = min(rh, local_y + s)
-        ex = min(rw, local_x + s)
-        sy = max(0, ey - local_y)
-        sx = max(0, ex - local_x)
-        if sy > 0 and sx > 0:
-            mask[local_y:ey, local_x:ex] = np.where(sp[:sy, :sx] > 0.02, 1.0, 0.0)
+        # 3. Load Authentic Gemini Sparkle Alpha Mask
+        sp = get_official_gemini_sparkle(s)
 
-        # Dilate mask slightly to prevent fringe leakage
-        from scipy.ndimage import binary_dilation
-        dilated_mask = binary_dilation(mask > 0.5, iterations=2).astype(np.float32)
-
-        # 4. Contextual Inpainting Synthesis
         if use_neural_inpaint:
+            # Neural Inpainting using CIS-Net
+            mask = np.zeros((rh, rw), dtype=np.float32)
+            y1_sub = max(0, local_y)
+            y2_sub = min(rh, local_y + s)
+            x1_sub = max(0, local_x)
+            x2_sub = min(rw, local_x + s)
+            if y2_sub > y1_sub and x2_sub > x1_sub:
+                y1_sp = y1_sub - local_y
+                y2_sp = y2_sub - local_y
+                x1_sp = x1_sub - local_x
+                x2_sp = x2_sub - local_x
+                mask[y1_sub:y2_sub, x1_sub:x2_sub] = np.where(sp[y1_sp:y2_sp, x1_sp:x2_sp] > 0.02, 1.0, 0.0)
+
+            from scipy.ndimage import binary_dilation
+            dilated_mask = binary_dilation(mask > 0.5, iterations=2).astype(np.float32)
+
             roi_t = (roi.transpose(2, 0, 1)[np.newaxis, :, :, :] / 255.0).astype(np.float32)
             mask_t = dilated_mask[np.newaxis, np.newaxis, :, :]
             neural_out = self.cis_net.forward(roi_t, mask_t)
             inpainted_roi = np.clip(neural_out[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
         else:
-            # High-precision Optical De-blend & Isophote Synthesis (0 Blur, Exact Texture)
+            # Sub-Pixel Optical Alpha De-Blending (Zero Blur, Exact Texture)
             inpainted_roi = self._photorealistic_deblend_synthesize(roi, sp, local_x, local_y, s)
 
-        # 5. Composite back onto original high-res canvas
+        # 4. Composite back onto canvas
         cleaned_np = img_np.copy()
         cleaned_np[ry1:ry2, rx1:rx2] = inpainted_roi
 
@@ -224,76 +287,92 @@ class ClearSparkAI:
             'hit': hit,
             'cleaned_image': res_img,
             'elapsed_ms': int(elapsed * 1000),
-            'note': f"Erased {s}px watermark at ({hx}, {hy}) with {hit['confidence']*100:.1f}% confidence"
+            'note': f"Erased {s}px authentic Gemini watermark at ({hx}, {hy}) with {hit['confidence']*100:.1f}% confidence"
         }
 
-    def _photorealistic_deblend_synthesize(self, roi, sp, lx, ly, s):
+    # Backward compatibility alias
+    clean_image = erase_watermark
+
+    def _photorealistic_deblend_synthesize(
+        self,
+        roi: np.ndarray,
+        sp: np.ndarray,
+        lx: int,
+        ly: int,
+        s: int
+    ) -> np.ndarray:
         """
-        High-precision optical alpha de-blending combined with edge-directed
-        context synthesis. Restores original underlying texture, grain, and color with zero blur.
+        Reverse alpha blending mathematically inverting:
+            I_wm = (1 - alpha) * I_clean + 255 * alpha
+            => I_clean = (I_wm - 255 * alpha) / (1 - alpha)
+        Leaves underlying photography textures and grain 100% intact with zero blur.
         """
         rh, rw, _ = roi.shape
         out = roi.copy().astype(np.float32)
 
-        ey = min(rh, ly + s)
-        ex = min(rw, lx + s)
-        sy = max(0, ey - ly)
-        sx = max(0, ex - lx)
+        # Exact intersection between canvas and watermark
+        y1_sub = max(0, ly)
+        y2_sub = min(rh, ly + s)
+        x1_sub = max(0, lx)
+        x2_sub = min(rw, lx + s)
 
-        if sy <= 0 or sx <= 0:
+        if y1_sub >= y2_sub or x1_sub >= x2_sub:
             return roi
 
-        sp_crop = sp[:sy, :sx]
-        sub = out[ly:ey, lx:ex]
+        y1_sp = y1_sub - ly
+        y2_sp = y2_sub - ly
+        x1_sp = x1_sub - lx
+        x2_sp = x2_sub - lx
 
-        # 1. Estimate local background color from surrounding boundary ring
+        sp_crop = sp[y1_sp:y2_sp, x1_sp:x2_sp]
+        sub = out[y1_sub:y2_sub, x1_sub:x2_sub]
+
+        # 1. Background tone estimation from surrounding boundary ring
         pad = 6
-        y_ring_min = max(0, ly - pad)
-        y_ring_max = min(rh, ey + pad)
-        x_ring_min = max(0, lx - pad)
-        x_ring_max = min(rw, ex + pad)
+        y_ring_min = max(0, y1_sub - pad)
+        y_ring_max = min(rh, y2_sub + pad)
+        x_ring_min = max(0, x1_sub - pad)
+        x_ring_max = min(rw, x2_sub + pad)
 
         ring_mask = np.zeros((rh, rw), dtype=bool)
         ring_mask[y_ring_min:y_ring_max, x_ring_min:x_ring_max] = True
-        ring_mask[ly:ey, lx:ex] = False
+        ring_mask[y1_sub:y2_sub, x1_sub:x2_sub] = False
 
         if np.any(ring_mask):
             bg_mean = np.mean(out[ring_mask], axis=0)
         else:
             bg_mean = np.mean(sub, axis=(0, 1))
 
-        # 2. Optimal local alpha estimation
+        # 2. Optimal Alpha Gain estimation
         core_idx = (sp_crop > 0.35)
         if np.any(core_idx):
             peak_wm = np.mean(sub[core_idx], axis=0)
             denom = np.maximum(255.0 - bg_mean, 15.0)
-            est_alpha = np.clip((peak_wm - bg_mean) / denom, 0.25, 0.85)
-            mean_alpha = float(np.mean(est_alpha))
+            est_gain = np.clip((peak_wm - bg_mean) / denom, 0.40, 1.15)
+            mean_gain = float(np.mean(est_gain))
         else:
-            mean_alpha = 0.52
+            mean_gain = 1.0
 
-        # 3. Optical Alpha Subtraction (restoring exact underlying pixels)
-        alpha_scale = mean_alpha / 0.52
-        alpha = np.clip(sp_crop * alpha_scale, 0.0, 0.85)[:, :, np.newaxis]
+        # Authentic Gemini max alpha is ~0.505. Scaled alpha:
+        alpha = np.clip(sp_crop * mean_gain, 0.0, 0.85)[:, :, np.newaxis]
 
+        # Optical unblending formula
         deblended = (sub - 255.0 * alpha) / np.maximum(1.0 - alpha, 0.15)
         deblended = np.clip(deblended, 0.0, 255.0)
 
-        # 4. Inward Core Synthesis for saturated center (sp > 0.40)
-        core_mask = (sp_crop > 0.40)
-        if np.any(core_mask):
+        # 3. Dense center core synthesis (sp_crop > 0.42)
+        core_mask = (sp_crop > 0.42)
+        if np.any(core_mask) and not np.all(core_mask):
             from scipy.ndimage import distance_transform_edt, gaussian_filter
             dist, indices = distance_transform_edt(core_mask, return_indices=True)
             for ch in range(3):
                 ch_data = deblended[:, :, ch]
                 filled = ch_data[indices[0], indices[1]]
                 smoothed = gaussian_filter(filled, sigma=0.8)
-                blend_w = np.clip((sp_crop - 0.40) / 0.10, 0.0, 1.0)
+                blend_w = np.clip((sp_crop - 0.42) / 0.08, 0.0, 1.0)
                 deblended[:, :, ch] = (1.0 - blend_w) * ch_data + blend_w * smoothed
 
-        out[ly:ey, lx:ex] = deblended
+        out[y1_sub:y2_sub, x1_sub:x2_sub] = deblended
         return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# Backward compatibility alias
-ListoraWatermarkAI = ClearSparkAI

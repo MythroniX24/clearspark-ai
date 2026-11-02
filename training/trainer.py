@@ -158,7 +158,7 @@ class WatermarkAITrainer:
         import json
         with open(meta_path, "w") as f:
             json.dump({
-                "model_name": "Listora SparkleNet AI v2.0",
+                "model_name": "ClearSpark AI v2.0",
                 "backbone": "Residual Dense Attention U-Net",
                 "in_channels": 3,
                 "base_channels": 16,

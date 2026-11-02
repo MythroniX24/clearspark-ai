@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Model Training Script for Listora Watermark AI
+Model Training Script for ClearSpark AI
 Generates synthetic dataset and trains the WAL-Net and CIS-Net architectures.
 """
 
@@ -14,7 +14,7 @@ from training.trainer import WatermarkAITrainer
 def main(epochs=None, steps=None):
     if epochs is None or steps is None:
         import argparse
-        parser = argparse.ArgumentParser(description="Train Listora Watermark AI")
+        parser = argparse.ArgumentParser(description="Train ClearSpark AI")
         parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
         parser.add_argument("--steps", type=int, default=15, help="Steps per epoch")
         args, _ = parser.parse_known_args()
@@ -25,7 +25,7 @@ def main(epochs=None, steps=None):
         steps_per_epoch = steps
 
     print("=" * 65)
-    print("   LISTORA WATERMARK AI — DEEP LEARNING MODEL TRAINING PIPELINE")
+    print("   CLEARSPARK AI — DEEP LEARNING MODEL TRAINING PIPELINE")
     print("=" * 65)
 
     print("\n[1/3] Initializing Neural Network Architectures...")

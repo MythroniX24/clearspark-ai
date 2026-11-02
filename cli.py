@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-CLI Tool for Listora Watermark AI
+CLI Tool for ClearSpark AI
 Usage:
-    python3 cli.py clean <input_image> [output_image]
+    python3 cli.py clean <input_image> [-o output_image] [--neural]
     python3 cli.py detect <input_image>
-    python3 cli.py train
+    python3 cli.py train [--epochs N] [--steps N]
+    python3 cli.py download-data [--count N]
     python3 cli.py benchmark [image_dir]
 """
 
