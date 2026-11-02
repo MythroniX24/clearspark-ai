@@ -1,0 +1,13 @@
+{
+  "model_name": "ClearSpark AI v2.0",
+  "backbone": "Residual Dense Attention U-Net",
+  "in_channels": 3,
+  "base_channels": 16,
+  "inpainter": "Contextual Gated Convolutional Network",
+  "supported_watermarks": [
+    "Google Gemini",
+    "Imagen 3",
+    "DeepMind SynthID Sparkle"
+  ],
+  "dataset_type": "Real Uncropped Web Photography (1024x1024)"
+}
