@@ -29,7 +29,11 @@ from models.sparklenet_v2 import (
     ContextualGenerativeInpainter,
     export_pytorch_to_web_json
 )
-from training.dataset_20k import Sparkle20kDataset, generate_calibrated_gemini_sparkle
+from training.dataset_20k import (
+    RealPhotoWatermarkDataset,
+    Sparkle20kDataset,
+    generate_calibrated_gemini_sparkle
+)
 
 
 # ── Advanced Loss Functions ──────────────────────────────────────────────────
@@ -105,10 +109,10 @@ def train_model(args):
     print(f"=================================================================\n")
 
     # 1. Dataset & DataLoader
-    dataset = Sparkle20kDataset(
+    dataset = RealPhotoWatermarkDataset(
         total_samples=args.samples,
         patch_size=args.patch_size,
-        external_img_dir=args.external_data
+        img_dir=args.external_data
     )
     dataloader = DataLoader(
         dataset,
@@ -135,9 +139,18 @@ def train_model(args):
     # 4. Losses & Mixed Precision Scaler
     dark_loss_fn = LuminanceAwareDarkLoss(weight=3.0).to(device)
     sobel_loss_fn = SobelGradientLoss(device)
-    bce_loss_fn = nn.BCELoss()
+    bce_logits_fn = nn.BCEWithLogitsLoss()
     smooth_l1_fn = nn.SmoothL1Loss()
-    scaler = GradScaler(enabled=(device.type == 'cuda'))
+    try:
+        scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+    except Exception:
+        scaler = GradScaler(enabled=(device.type == 'cuda'))
+
+    def get_autocast(dev):
+        try:
+            return torch.amp.autocast('cuda', enabled=(dev.type == 'cuda'))
+        except Exception:
+            return autocast(enabled=(dev.type == 'cuda'))
 
     best_loss = float('inf')
     os.makedirs(args.output_dir, exist_ok=True)
@@ -160,22 +173,17 @@ def train_model(args):
 
             optimizer.zero_grad()
 
-            with autocast(enabled=(device.type == 'cuda')):
+            with get_autocast(device):
                 # ── WAL-Net Forward Pass (Multi-scale Localization)
                 wal_out = wal_net(wm_img)
-                # Numerical stability clamp prevents log(0) NaN under FP16 autocast
-                pred_mask = torch.clamp(wal_out['mask'], 1e-6, 1.0 - 1e-6)
-                pred_box = wal_out['bbox']
-                pred_conf = torch.clamp(wal_out['confidence'], 1e-6, 1.0 - 1e-6)
-
-                loss_mask = bce_loss_fn(pred_mask, gt_mask)
-                loss_box = smooth_l1_fn(pred_box, gt_box)
-                loss_conf = bce_loss_fn(pred_conf, gt_conf)
+                loss_mask = bce_logits_fn(wal_out['mask_logits'], gt_mask)
+                loss_box = smooth_l1_fn(wal_out['bbox'], gt_box)
+                loss_conf = bce_logits_fn(wal_out['conf_logits'], gt_conf)
                 loss_wal = loss_mask * 2.0 + loss_box * 1.0 + loss_conf * 0.5
 
                 # ── CIS-Net Forward Pass (Contextual Inpainting)
                 # Training mask: Combine predicted high-confidence pixels with ground truth
-                train_mask = torch.max((pred_mask > 0.4).float(), gt_mask)
+                train_mask = torch.max((wal_out['mask'] > 0.4).float(), gt_mask)
                 inpainted, synth_rgb = cis_net(wm_img, train_mask)
 
                 # Contextual Reconstruction Losses

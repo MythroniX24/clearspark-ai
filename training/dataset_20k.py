@@ -48,7 +48,9 @@ class RealPhotoWatermarkDataset(Dataset if HAS_TORCH else object):
     Loads real images from COCO 2017, Places365, Unsplash, or local directories.
     Applies authentic Google Gemini watermark at arbitrary scales (24px to 160px).
     """
-    def __init__(self, img_dir=None, total_samples=20000, patch_size=128):
+    def __init__(self, img_dir=None, total_samples=20000, patch_size=128, external_img_dir=None):
+        if external_img_dir is not None and img_dir is None:
+            img_dir = external_img_dir
         self.patch_size = patch_size
         self.total_samples = total_samples
         self.image_paths = []
@@ -210,3 +212,7 @@ class RealPhotoWatermarkDataset(Dataset if HAS_TORCH else object):
                 torch.tensor(is_dark, dtype=torch.bool)
             )
         return watermarked, clean, mask, bbox, conf, is_dark
+
+
+# Backward compatibility alias
+Sparkle20kDataset = RealPhotoWatermarkDataset

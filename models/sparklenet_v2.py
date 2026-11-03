@@ -161,10 +161,10 @@ if HAS_TORCH:
             # Confidence & Continuous Scale BBox
             c_feat = self.conf_act(self.conf_conv(b))
             c_gap = self.conf_gap(c_feat)
-            c_out = torch.sigmoid(self.conf_fc(c_gap)) # (N, 5, 1, 1)
-
-            conf = c_out[:, 0:1, 0, 0] # (N, 1)
-            bbox = c_out[:, 1:5, 0, 0] # (N, 4) -> [cx, cy, w, h]
+            c_raw = self.conf_fc(c_gap) # (N, 5, 1, 1) raw logits
+            conf_logits = c_raw[:, 0:1, 0, 0] # (N, 1)
+            conf = torch.sigmoid(conf_logits)
+            bbox = torch.sigmoid(c_raw[:, 1:5, 0, 0]) # (N, 4) -> [cx, cy, w, h]
 
             # Decoder (robust spatial size matching for arbitrary input dimensions)
             u1 = self.up1_act(self.conv_up1(F.interpolate(b, size=d1.shape[2:], mode='nearest')))
@@ -173,11 +173,14 @@ if HAS_TORCH:
             u2 = self.up2_act(self.conv_up2(F.interpolate(f1, size=s0.shape[2:], mode='nearest')))
             f2 = self.fuse2_act(self.fuse2(torch.cat([u2, s0], dim=1)))
 
-            mask = torch.sigmoid(self.mask_head(f2))
+            mask_logits = self.mask_head(f2)
+            mask = torch.sigmoid(mask_logits)
 
             return {
                 'mask': mask,
+                'mask_logits': mask_logits,
                 'confidence': conf,
+                'conf_logits': conf_logits,
                 'bbox': bbox
             }
 
