@@ -1,18 +1,13 @@
 """
-Massive 20,000+ Photographic Watermark Dataset Generator & PyTorch Dataset
-Engineered for Kaggle GPU Training.
-
-Key Capabilities:
-1. 20,000+ Dynamic Photographic Samples (35% Dark/Night Scenes, 35% High-Frequency Textures, 30% Smooth Gradients).
-2. Arbitrary Multi-Scale Watermark Synthesis (24px to 160px) for true scale-invariance.
-3. 15% Negative Hard Clean Samples for zero false-positive immunity.
-4. Optical Linear Reverse-Alpha Blending with Camera ISO & JPEG Noise.
-5. Plug-and-play support for Kaggle external image datasets (COCO, Places365, Unsplash, Flickr).
+ClearSpark AI — 100% Real Photography Dataset Loader (20,000+ Images)
+Permanently configured to use ONLY real-world photography (COCO, Places365, Unsplash, Flickr).
+Synthetic/procedural textures are strictly prohibited per permanent system directive.
 """
 
 import os
 import math
 import random
+import glob
 import numpy as np
 from PIL import Image
 
@@ -25,10 +20,7 @@ except ImportError:
 
 
 def generate_calibrated_gemini_sparkle(size: int) -> np.ndarray:
-    """
-    Generates authentic Google Gemini 4-pointed sparkle alpha channel.
-    Matches authentic pixel calibration across any arbitrary resolution.
-    """
+    """Authentic Google Gemini 4-pointed sparkle alpha channel."""
     alpha = np.zeros((size, size), dtype=np.float32)
     cx = (size - 1.0) / 2.0
     cy = (size - 1.0) / 2.0
@@ -50,123 +42,55 @@ def generate_calibrated_gemini_sparkle(size: int) -> np.ndarray:
     return alpha
 
 
-class PhotographicPatchEngine:
+class RealPhotoWatermarkDataset(Dataset if HAS_TORCH else object):
     """
-    Generates diverse photographic background patches across 3 primary distributions:
-    1. Dark Scenes & Deep Shadows (Night photography, astrophotography, dark fabric)
-    2. Complex Micro-Textures (Foliage, brick, wood, cloth weave, skin)
-    3. Natural Skies & Color Shifts (Sunsets, studio lighting, bokeh)
+    100% Real Photography Dataset Loader.
+    Loads real images from COCO 2017, Places365, Unsplash, or local directories.
+    Applies authentic Google Gemini watermark at arbitrary scales (24px to 160px).
     """
-    def __init__(self, patch_size=128):
-        self.S = patch_size
-
-    def generate_dark_patch(self):
-        """Generates realistic dark / low-contrast photographic textures."""
-        S = self.S
-        mode = random.choice(['night_sky', 'shadow_crevice', 'dark_fabric', 'dim_room'])
-
-        if mode == 'night_sky':
-            # Low ambient base (0.02 - 0.12) with faint star dust
-            base = np.random.uniform(0.01, 0.08, size=(3, 1, 1)).astype(np.float32)
-            noise = np.random.exponential(0.015, size=(3, S, S)).astype(np.float32)
-            # Occasional faint star
-            stars = (np.random.rand(1, S, S) > 0.985).astype(np.float32) * np.random.uniform(0.2, 0.6, size=(1, S, S))
-            img = base + noise + stars
-        elif mode == 'shadow_crevice':
-            # Vignette gradient falling off into deep black
-            c1 = np.random.uniform(0.05, 0.20, size=(3, 1, 1)).astype(np.float32)
-            c2 = np.random.uniform(0.00, 0.04, size=(3, 1, 1)).astype(np.float32)
-            gx = np.linspace(0, 1, S).reshape(1, 1, S)
-            gy = np.linspace(0, 1, S).reshape(1, S, 1)
-            img = c1 * (1.0 - gx) + c2 * gy
-        elif mode == 'dark_fabric':
-            # High frequency dark weave
-            base = np.random.uniform(0.03, 0.15, size=(3, 1, 1)).astype(np.float32)
-            freq_x = np.sin(np.linspace(0, 12 * np.pi, S)).reshape(1, 1, S)
-            freq_y = np.cos(np.linspace(0, 12 * np.pi, S)).reshape(1, S, 1)
-            weave = 0.02 * (freq_x + freq_y)
-            img = base + weave + np.random.normal(0, 0.01, size=(3, S, S))
-        else: # dim room
-            base = np.random.uniform(0.04, 0.18, size=(3, 1, 1)).astype(np.float32)
-            noise = np.random.normal(0, 0.02, size=(3, S, S)).astype(np.float32)
-            img = base + noise
-
-        return np.clip(img, 0.0, 1.0).astype(np.float32)
-
-    def generate_textured_patch(self):
-        """Generates complex natural micro-textures."""
-        S = self.S
-        mode = random.choice(['foliage', 'brick_lines', 'skin_texture', 'organic_cells'])
-
-        if mode == 'foliage':
-            # Green / earthy mottled textures
-            base = np.array([0.15, 0.35, 0.12]).reshape(3, 1, 1) * np.random.uniform(0.6, 1.3)
-            speckle = np.random.normal(0, 0.08, size=(3, S, S))
-            img = base + speckle
-        elif mode == 'brick_lines':
-            # High-frequency horizontal and vertical mortar lines
-            base = np.array([0.55, 0.25, 0.18]).reshape(3, 1, 1) * np.random.uniform(0.7, 1.2)
-            line_y = (np.arange(S) % 24 < 3).reshape(1, S, 1) * -0.15
-            line_x = (np.arange(S) % 36 < 3).reshape(1, 1, S) * -0.15
-            img = base + line_y + line_x + np.random.normal(0, 0.03, size=(3, S, S))
-        elif mode == 'skin_texture':
-            # Warm tone with micro-pores
-            base = np.array([0.78, 0.60, 0.52]).reshape(3, 1, 1) * np.random.uniform(0.8, 1.1)
-            pores = np.random.normal(0, 0.025, size=(3, S, S))
-            img = base + pores
-        else:
-            base = np.random.uniform(0.2, 0.7, size=(3, 1, 1))
-            freq = np.sin(np.linspace(0, 6 * np.pi, S)).reshape(1, S, 1) * 0.06
-            img = base + freq + np.random.normal(0, 0.04, size=(3, S, S))
-
-        return np.clip(img, 0.0, 1.0).astype(np.float32)
-
-    def generate_gradient_patch(self):
-        """Generates smooth natural skies, studio backgrounds, and sunsets."""
-        S = self.S
-        c1 = np.random.uniform(0.2, 0.95, size=(3, 1, 1)).astype(np.float32)
-        c2 = np.random.uniform(0.2, 0.95, size=(3, 1, 1)).astype(np.float32)
-        angle = np.random.uniform(0, 2 * np.pi)
-        x_grid = np.linspace(-1, 1, S).reshape(1, 1, S)
-        y_grid = np.linspace(-1, 1, S).reshape(1, S, 1)
-        ramp = (math.cos(angle) * x_grid + math.sin(angle) * y_grid + 1.414) / 2.828
-        img = c1 * (1.0 - ramp) + c2 * ramp + np.random.normal(0, 0.008, size=(3, S, S))
-        return np.clip(img, 0.0, 1.0).astype(np.float32)
-
-    def generate_patch(self):
-        """Picks patch type based on distribution: 35% dark, 35% texture, 30% gradient."""
-        roll = random.random()
-        if roll < 0.35:
-            return self.generate_dark_patch(), True # is_dark = True
-        elif roll < 0.70:
-            return self.generate_textured_patch(), False
-        else:
-            return self.generate_gradient_patch(), False
-
-
-class Sparkle20kDataset(Dataset if HAS_TORCH else object):
-    """
-    PyTorch Dataset providing 20,000+ training samples on-the-fly or from disk images.
-    """
-    def __init__(self, total_samples=20000, patch_size=128, external_img_dir=None):
-        self.total_samples = total_samples
+    def __init__(self, img_dir=None, total_samples=20000, patch_size=128):
         self.patch_size = patch_size
-        self.engine = PhotographicPatchEngine(patch_size)
+        self.total_samples = total_samples
+        self.image_paths = []
 
-        # Pre-cache canonical watermark shapes
+        # Find all real image files in directories
+        search_dirs = []
+        if img_dir:
+            search_dirs.append(img_dir)
+
+        # Standard Kaggle dataset mount locations
+        kaggle_standard_dirs = [
+            "/kaggle/input/coco-2017-dataset/coco2017/train2017",
+            "/kaggle/input/coco-2017-dataset/coco2017/val2017",
+            "/kaggle/input/coco-2017-dataset/coco2017/test2017",
+            "/kaggle/input/coco2017/val2017",
+            "/kaggle/input/coco2017/train2017",
+            "/kaggle/input/places365-standard",
+            "/kaggle/input/unsplash-dataset",
+            "/kaggle/working/real_photos_20k"
+        ]
+        search_dirs.extend(kaggle_standard_dirs)
+
+        for d in search_dirs:
+            if os.path.exists(d):
+                for root, _, files in os.walk(d):
+                    for f in files:
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                            self.image_paths.append(os.path.join(root, f))
+                            if len(self.image_paths) >= 50000:
+                                break
+                    if len(self.image_paths) >= 50000:
+                        break
+            if len(self.image_paths) >= 20000:
+                break
+
+        print(f"📸 [RealPhotoDataset] Loaded {len(self.image_paths):,} authentic real-world camera photographs.")
+
+        # Cache canonical watermark templates
         self.cached_sparkles = {
             s: generate_calibrated_gemini_sparkle(s)
             for s in [24, 32, 36, 42, 48, 56, 64, 72, 80, 96, 112, 128]
         }
-
-        # Check for external images
-        self.external_images = []
-        if external_img_dir and os.path.exists(external_img_dir):
-            for root, _, files in os.walk(external_img_dir):
-                for f in files:
-                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                        self.external_images.append(os.path.join(root, f))
-            print(f"[Dataset] Found {len(self.external_images)} external images in {external_img_dir}")
 
     def __len__(self):
         return self.total_samples
@@ -181,25 +105,35 @@ class Sparkle20kDataset(Dataset if HAS_TORCH else object):
     def __getitem__(self, idx):
         S = self.patch_size
 
-        # 1. Fetch clean background patch
-        if self.external_images and random.random() > 0.4:
-            try:
-                img_path = random.choice(self.external_images)
-                with Image.open(img_path) as im:
-                    im = im.convert('RGB')
-                    w, h = im.size
-                    if w >= S and h >= S:
-                        rx = random.randint(0, w - S)
-                        ry = random.randint(0, h - S)
-                        crop = im.crop((rx, ry, rx + S, ry + S))
-                        clean = np.array(crop, dtype=np.float32).transpose(2, 0, 1) / 255.0
-                        is_dark = float(np.mean(clean)) < 0.25
-                    else:
-                        clean, is_dark = self.engine.generate_patch()
-            except Exception:
-                clean, is_dark = self.engine.generate_patch()
-        else:
-            clean, is_dark = self.engine.generate_patch()
+        # 1. Fetch real camera photograph
+        if not self.image_paths:
+            raise RuntimeError(
+                "❌ No real images found! Please attach COCO 2017, Unsplash, or download real images to run training. "
+                "Synthetic images are strictly forbidden."
+            )
+
+        img_path = self.image_paths[idx % len(self.image_paths)]
+        try:
+            with Image.open(img_path) as im:
+                im = im.convert('RGB')
+                w, h = im.size
+                if w >= S and h >= S:
+                    rx = random.randint(0, w - S)
+                    ry = random.randint(0, h - S)
+                    crop = im.crop((rx, ry, rx + S, ry + S))
+                else:
+                    crop = im.resize((S, S), Image.Resampling.BILINEAR)
+                clean = np.array(crop, dtype=np.float32).transpose(2, 0, 1) / 255.0
+        except Exception:
+            # Fallback to another real image if one file is corrupt
+            alt_path = random.choice(self.image_paths)
+            with Image.open(alt_path) as im:
+                crop = im.convert('RGB').resize((S, S), Image.Resampling.BILINEAR)
+                clean = np.array(crop, dtype=np.float32).transpose(2, 0, 1) / 255.0
+
+        # Check luminance for dark background penalty
+        lum = 0.299 * clean[0] + 0.587 * clean[1] + 0.114 * clean[2]
+        is_dark = float(np.mean(lum)) < 0.30
 
         # 2. Hard Clean Negative Samples (15% probability: no watermark applied)
         if random.random() < 0.15:
@@ -217,8 +151,8 @@ class Sparkle20kDataset(Dataset if HAS_TORCH else object):
                 )
             return clean, clean, empty_mask, empty_bbox, conf, is_dark
 
-        # 3. Watermark Scale & Position Synthesis
-        # Arbitrary scale: 24px to min(S - 8, 96px)
+        # 3. Watermark Scale & Position on Real Photo
+        # Scale Invariance: 24px to min(S - 8, 96px)
         max_s = min(S - 8, 96)
         s_size = random.randint(24, max_s)
         base_sparkle = self.get_sparkle_alpha(s_size)
@@ -227,7 +161,7 @@ class Sparkle20kDataset(Dataset if HAS_TORCH else object):
         gain = random.uniform(0.45, 1.15)
         sp_alpha = np.clip(base_sparkle * gain, 0.0, 0.96)
 
-        # Positions: 70% Bottom-Right, 15% Bottom-Left, 15% Random Margin
+        # Positions: 70% Bottom-Right, 15% Bottom-Left, 15% Random Margins
         corner_roll = random.random()
         margin = random.choice([8, 12, 16, 24, 32, 48])
         if corner_roll < 0.70:
@@ -243,22 +177,21 @@ class Sparkle20kDataset(Dataset if HAS_TORCH else object):
         x0 = max(0, min(S - s_size, x0))
         y0 = max(0, min(S - s_size, y0))
 
-        # 4. Linear Optical Alpha Blending: I_wm = I_clean * (1 - alpha) + 1.0 * alpha
+        # 4. Authentic Linear Optical Alpha Blending: I_wm = I_clean * (1 - alpha) + 1.0 * alpha
         watermarked = clean.copy()
         mask = np.zeros((1, S, S), dtype=np.float32)
 
-        alpha_3d = sp_alpha[np.newaxis, :, :] # (1, s, s)
+        alpha_3d = sp_alpha[np.newaxis, :, :]
         patch_clean = clean[:, y0:y0+s_size, x0:x0+s_size]
 
         watermarked[:, y0:y0+s_size, x0:x0+s_size] = patch_clean * (1.0 - alpha_3d) + 1.0 * alpha_3d
         mask[0, y0:y0+s_size, x0:x0+s_size] = np.where(sp_alpha > 0.02, 1.0, 0.0)
 
-        # 5. Realistic Camera Sensor & Compression Artifacts
+        # 5. Real Camera ISO Grain & Sensor Noise
         if random.random() > 0.35:
             iso_noise = np.random.normal(0, random.uniform(0.005, 0.018), size=watermarked.shape)
             watermarked = np.clip(watermarked + iso_noise, 0.0, 1.0).astype(np.float32)
 
-        # Continuous scale bounding box: [cx, cy, w, h] normalized in [0, 1]
         bbox = np.array([
             (x0 + s_size / 2.0) / S,
             (y0 + s_size / 2.0) / S,
