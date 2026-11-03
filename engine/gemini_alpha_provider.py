@@ -5,7 +5,7 @@ providing sub-pixel precise alpha channels, dual-polarity outline compensation, 
 """
 
 import os
-from typing import Dict, List, Any
+from typing import Dict, Any, List
 import numpy as np
 from PIL import Image
 
@@ -31,19 +31,16 @@ def load_official_alpha_map(size: int = 48) -> np.ndarray:
     if os.path.exists(filepath):
         im = Image.open(filepath)
         arr = np.array(im).astype(np.float32)
-        # Max across RGB channels divided by 255 gives authentic alpha
         if arr.ndim == 3:
             alpha = np.max(arr[:, :, :3], axis=-1) / 255.0
         else:
             alpha = arr / 255.0
 
         if size not in [48, 96] or alpha.shape[0] != size:
-            # Resample smoothly to requested size
             im_alpha = Image.fromarray((alpha * 255.0).astype(np.uint8))
             im_resized = im_alpha.resize((size, size), Image.Resampling.LANCZOS)
             alpha = np.array(im_resized).astype(np.float32) / 255.0
     else:
-        # Fallback procedural shape if asset file missing
         alpha = _generate_fallback_gemini_profile(size)
 
     _ALPHA_CACHE[size] = alpha
@@ -57,13 +54,9 @@ def get_official_gemini_sparkle(
 ) -> np.ndarray:
     """
     Returns the official Google Gemini sparkle alpha profile scaled to requested size and gain.
-    Args:
-        size: Target watermark bounding side in pixels.
-        alpha_gain: Multiplicative opacity modifier.
-        dark_polarity: Reserved for inverted/dark background outline compensation.
-    Returns:
-        float32 numpy array in range [0.0, 0.99].
     """
+    if size <= 0:
+        return np.zeros((0, 0), dtype=np.float32)
     base_alpha = load_official_alpha_map(size)
     scaled = np.clip(base_alpha * alpha_gain, 0.0, 0.99).astype(np.float32)
     return scaled
@@ -85,7 +78,6 @@ def _generate_fallback_gemini_profile(size: int) -> np.ndarray:
             dx = abs(x - cx) / radius
             dy = abs(y - cy) / radius
             r = np.sqrt(dx * dx + dy * dy)
-            # Organic astroid flare
             p = 0.52
             d_ast = (dx ** p + dy ** p) ** (1.0 / p)
             if d_ast <= 1.0:
@@ -102,72 +94,55 @@ def get_catalog_watermark_anchors(width: int, height: int) -> List[Dict[str, Any
     discrete resolution tier catalog and margin specifications.
     
     Each candidate is a dict:
-        {'x': int, 'y': int, 'size': int, 'margin': int, 'corner': str, 'name': str}
+        {'x': int, 'y': int, 'size': int, 'margin_x': int, 'margin_y': int, 'corner': str, 'name': str}
     """
     if width <= 0 or height <= 0:
         return []
 
-    anchors = []
-    is_large = (width > 1024 or height > 1024)
+    anchors: List[Dict[str, Any]] = []
 
-    # 1. Primary Bottom-Right Imagen 3 / Gemini 3x Large Margin (Current Standard)
-    if not is_large:
-        # 1K standard images (e.g. 1024x1024)
-        anchors.append({
-            'size': 48, 'margin_x': 96, 'margin_y': 96,
-            'x': width - 96 - 48, 'y': height - 96 - 48,
-            'corner': 'br', 'name': '1k-large-margin (Current)'
-        })
-        anchors.append({
-            'size': 48, 'margin_x': 32, 'margin_y': 32,
-            'x': width - 32 - 48, 'y': height - 32 - 48,
-            'corner': 'br', 'name': '1k-small-margin (Classic)'
-        })
-    else:
-        # 2K/4K large images (e.g. 2048x2048 or widescreen exports)
-        anchors.append({
-            'size': 96, 'margin_x': 192, 'margin_y': 192,
-            'x': width - 192 - 96, 'y': height - 192 - 96,
-            'corner': 'br', 'name': '2k-new-margin (Current)'
-        })
-        anchors.append({
-            'size': 96, 'margin_x': 64, 'margin_y': 64,
-            'x': width - 64 - 96, 'y': height - 64 - 96,
-            'corner': 'br', 'name': '2k-legacy-margin'
-        })
-        # Widescreen 1K tier fallback on 2K canvas
-        anchors.append({
-            'size': 48, 'margin_x': 96, 'margin_y': 96,
-            'x': width - 96 - 48, 'y': height - 96 - 48,
-            'corner': 'br', 'name': '1k-large-margin fallback'
-        })
+    def add_anchor(s: int, mx: int, my: int, corner: str, name: str) -> None:
+        if corner == 'br':
+            ax = width - mx - s
+            ay = height - my - s
+        elif corner == 'bl':
+            ax = mx
+            ay = height - my - s
+        else:
+            return
 
-    # 2. Known Secondary Variants (v2 small 36px, wide aspect 89px, 48px)
-    for s, m in [(36, 96), (48, 89), (48, 48), (48, 64), (32, 32), (64, 48)]:
-        ax = width - m - s
-        ay = height - m - s
-        if not any(a['x'] == ax and a['y'] == ay and a['size'] == s for a in anchors):
-            anchors.append({
-                'size': s, 'margin_x': m, 'margin_y': m,
-                'x': ax, 'y': ay,
-                'corner': 'br', 'name': f'br-{s}px-m{m}'
-            })
+        if 0 <= ax <= width - s and 0 <= ay <= height - s:
+            if not any(a['x'] == ax and a['y'] == ay and a['size'] == s for a in anchors):
+                anchors.append({
+                    'size': s, 'margin_x': mx, 'margin_y': my,
+                    'x': ax, 'y': ay,
+                    'corner': corner, 'name': name
+                })
 
-    # 3. Bottom-Left (RTL mode / localized Gemini exports)
-    for s, m in [(48, 96), (48, 32)]:
-        ax = m
-        ay = height - m - s
-        anchors.append({
-            'size': s, 'margin_x': m, 'margin_y': m,
-            'x': ax, 'y': ay,
-            'corner': 'bl', 'name': f'bl-{s}px-m{m}'
-        })
+    # 1. Primary Bottom-Right Imagen 3 & Gemini Standards (Checked for ALL images)
+    # 48px @ margin 96px (Current Imagen 3 standard)
+    add_anchor(48, 96, 96, 'br', '1k-large-margin (Current)')
+    # 48px @ margin 32px (Classic Gemini standard - e.g. 20260520-1.png)
+    add_anchor(48, 32, 32, 'br', '1k-small-margin (Classic)')
+    # 48px @ margin 64px / 48px / 89px / 73px
+    add_anchor(48, 64, 64, 'br', 'br-48px-m64')
+    add_anchor(48, 48, 48, 'br', 'br-48px-m48')
+    add_anchor(48, 89, 89, 'br', 'br-48px-m89')
+    add_anchor(48, 73, 73, 'br', 'br-48px-m73')
 
-    # Strict coordinate boundary safeguarding
-    valid_anchors = []
-    for a in anchors:
-        s = a['size']
-        if a['x'] >= 0 and a['y'] >= 0 and (a['x'] + s <= width) and (a['y'] + s <= height):
-            valid_anchors.append(a)
+    # 2. Large 2K/4K Resolution Standards
+    if width > 1024 or height > 1024:
+        add_anchor(96, 192, 192, 'br', '2k-new-margin (Current)')
+        add_anchor(96, 64, 64, 'br', '2k-legacy-margin')
+        add_anchor(96, 96, 96, 'br', '2k-mid-margin')
 
-    return valid_anchors
+    # 3. Small v2 Variants
+    add_anchor(36, 96, 96, 'br', 'br-36px-m96')
+    add_anchor(36, 32, 32, 'br', 'br-36px-m32')
+    add_anchor(42, 82, 82, 'br', 'br-42px-m82')
+
+    # 4. Bottom-Left Standards (RTL mode / localized Gemini exports)
+    add_anchor(48, 96, 96, 'bl', 'bl-48px-m96')
+    add_anchor(48, 32, 32, 'bl', 'bl-48px-m32')
+
+    return anchors
