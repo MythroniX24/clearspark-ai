@@ -196,28 +196,40 @@ class ClearSparkAI:
             sp_before = cand['spatial_score']
             gr_before = cand['grad_score']
 
-            # Trial unblend with calibrated alpha
-            alpha_clean = np.maximum(0.0, tpl - ALPHA_NOISE_FLOOR)
-            alpha = np.clip(alpha_clean * 1.0, 0.0, 0.99)[:, :, np.newaxis]
-            trial_clean = np.clip(np.round((sub_rgb - alpha * LOGO_VALUE) / (1.0 - alpha)), 0.0, 255.0)
-            trial_g = 0.299 * trial_clean[:, :, 0] + 0.587 * trial_clean[:, :, 1] + 0.114 * trial_clean[:, :, 2]
+            # Trial unblend with calibrated adaptive alpha gains (supports ultra-faint to dense watermarks)
+            best_cand_suppression = -1.0
+            best_cand_dsp = 0.0
+            best_cand_dgr = 0.0
+            for g in [1.0, 0.70, 0.45, 0.25, 0.12]:
+                alpha_clean = np.maximum(0.0, tpl - ALPHA_NOISE_FLOOR)
+                alpha = np.clip(alpha_clean * g, 0.0, 0.99)[:, :, np.newaxis]
+                trial_clean = np.clip(np.round((sub_rgb - alpha * LOGO_VALUE) / (1.0 - alpha)), 0.0, 255.0)
+                trial_g = 0.299 * trial_clean[:, :, 0] + 0.587 * trial_clean[:, :, 1] + 0.114 * trial_clean[:, :, 2]
 
-            sp_after, gr_after = compute_spatial_and_grad_ncc(trial_g, tpl)
+                sp_after, gr_after = compute_spatial_and_grad_ncc(trial_g, tpl)
 
-            delta_sp = sp_before - sp_after
-            delta_gr = gr_before - gr_after
+                # Reject artificial gradient blowup
+                if gr_after > 0.40 and gr_after > gr_before + 0.20:
+                    continue
 
-            suppression_score = delta_sp + 1.2 * delta_gr
+                delta_sp = sp_before - sp_after
+                delta_gr = gr_before - gr_after
+                suppression_score = delta_sp + 1.2 * delta_gr
 
-            cand['delta_sp'] = delta_sp
-            cand['delta_gr'] = delta_gr
-            cand['suppression_score'] = suppression_score
+                if suppression_score > best_cand_suppression:
+                    best_cand_suppression = suppression_score
+                    best_cand_dsp = delta_sp
+                    best_cand_dgr = delta_gr
 
-            if suppression_score > best_suppression:
-                best_suppression = suppression_score
+            cand['delta_sp'] = best_cand_dsp
+            cand['delta_gr'] = best_cand_dgr
+            cand['suppression_score'] = best_cand_suppression
+
+            if best_cand_suppression > best_suppression:
+                best_suppression = best_cand_suppression
                 best_candidate = cand
 
-        if best_candidate and (best_suppression > 0.15 or best_candidate['grad_score'] > 0.20):
+        if best_candidate and (best_suppression > 0.06 or best_candidate['grad_score'] > 0.18):
             best_candidate['confidence'] = float(best_candidate['combined_score'])
             return best_candidate
 
@@ -340,7 +352,7 @@ class ClearSparkAI:
             min_residual = 999.0
             best_gain = 1.0
 
-            for test_gain in [0.60, 0.70, 0.80, 0.90, 1.00, 1.05]:
+            for test_gain in [round(float(x), 2) for x in np.linspace(0.05, 1.10, 22)]:
                 candidate_roi = self._photorealistic_deblend_synthesize(roi, sp, local_x, local_y, s, alpha_gain=test_gain)
                 ey = min(rh, local_y + s)
                 ex = min(rw, local_x + s)
