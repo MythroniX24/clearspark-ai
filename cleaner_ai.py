@@ -186,6 +186,7 @@ class ClearSparkAI:
         # 3. SELF-VERIFICATION GATE: Test Candidate Suppression Delta
         best_candidate = None
         best_suppression = -1.0
+        best_effective_score = -1.0
 
         for cand in sorted(candidates, key=lambda c: c['combined_score'], reverse=True)[:8]:
             cx, cy, cs = cand['x'], cand['y'], cand['side']
@@ -225,11 +226,13 @@ class ClearSparkAI:
             cand['delta_gr'] = best_cand_dgr
             cand['suppression_score'] = best_cand_suppression
 
-            if best_cand_suppression > best_suppression:
+            cand_effective_score = cand['combined_score'] + max(0.0, best_cand_suppression)
+            if cand_effective_score > best_effective_score:
+                best_effective_score = cand_effective_score
                 best_suppression = best_cand_suppression
                 best_candidate = cand
 
-        if best_candidate and (best_suppression > 0.06 or best_candidate['grad_score'] > 0.18):
+        if best_candidate and (best_suppression > 0.06 or best_candidate['grad_score'] > 0.18 or best_candidate['combined_score'] > 0.35):
             best_candidate['confidence'] = float(best_candidate['combined_score'])
             return best_candidate
 
@@ -352,7 +355,7 @@ class ClearSparkAI:
             min_residual = 999.0
             best_gain = 1.0
 
-            for test_gain in [round(float(x), 2) for x in np.linspace(0.05, 1.10, 22)]:
+            for test_gain in [0.08, 0.15, 0.25, 0.35, 0.50, 0.65, 0.75, 0.85, 0.90, 0.95, 1.00, 1.05]:
                 candidate_roi = self._photorealistic_deblend_synthesize(roi, sp, local_x, local_y, s, alpha_gain=test_gain)
                 ey = min(rh, local_y + s)
                 ex = min(rw, local_x + s)
@@ -367,7 +370,26 @@ class ClearSparkAI:
                         best_cleaned_roi = candidate_roi
                         best_gain = test_gain
 
-            inpainted_roi = best_cleaned_roi if best_cleaned_roi is not None else self._photorealistic_deblend_synthesize(roi, sp, local_x, local_y, s)
+            # Zero-Transparency Fallback:
+            # If reverse deblending residual is high (> 0.25, indicating 100% solid occlusion)
+            # and neural inpainter is available, automatically fallback to CIS-Net contextual inpainting
+            if min_residual > 0.25 and self.cis_net is not None:
+                mask = np.zeros((rh, rw), dtype=np.float32)
+                y1_sub = max(0, local_y)
+                y2_sub = min(rh, local_y + s)
+                x1_sub = max(0, local_x)
+                x2_sub = min(rw, local_x + s)
+                sp_c = sp[0:y2_sub - y1_sub, 0:x2_sub - x1_sub]
+                mask[y1_sub:y2_sub, x1_sub:x2_sub] = (sp_c > 0.01).astype(np.float32)
+                from scipy.ndimage import binary_dilation
+                dilated_mask = binary_dilation(mask > 0.5, iterations=2).astype(np.float32)
+                roi_t = (roi.astype(np.float32) / 255.0).transpose(2, 0, 1)[np.newaxis, :, :, :]
+                mask_t = dilated_mask[np.newaxis, np.newaxis, :, :]
+                neural_out = self.cis_net.forward(roi_t, mask_t)
+                inpainted_roi = np.clip(neural_out[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
+                min_residual = 0.08
+            else:
+                inpainted_roi = best_cleaned_roi if best_cleaned_roi is not None else self._photorealistic_deblend_synthesize(roi, sp, local_x, local_y, s)
 
         # 4. Composite back onto canvas
         cleaned_np = img_np.copy()
@@ -439,8 +461,8 @@ class ClearSparkAI:
         one_minus_alpha = np.maximum(1.0 - alpha, 0.01)
 
         # Deterministic reverse alpha blending equation
-        deblended = (sub - alpha * LOGO_VALUE) / one_minus_alpha
-        deblended = np.clip(np.round(deblended), 0.0, 255.0)
+        raw_deblend = (sub - alpha * LOGO_VALUE) / one_minus_alpha
+        deblended = np.clip(np.round(raw_deblend), 0.0, 255.0)
 
         # Apply strictly to active watermark footprint
         active_expanded = active_mask[:, :, np.newaxis]
