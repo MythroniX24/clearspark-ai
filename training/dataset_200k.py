@@ -57,11 +57,19 @@ class RealPhotoWatermarkDataset200k(Dataset if HAS_TORCH else object):
         image_paths=None,
         coco_dir="/kaggle/working/real_photos_20k/val2017",
         total_samples=200000,
-        patch_size=128
+        patch_size=128,
+        preload_to_ram=True,
+        max_ram_photos=3500
     ):
         self.patch_size = patch_size
         self.total_samples = total_samples
-        self.cached_sparkles = {}
+        self.preload_to_ram = preload_to_ram
+        self.ram_photos = []
+
+        # Pre-compute calibrated sparkles for all valid sizes (20 to 100) to eliminate calculation overhead
+        self.cached_sparkles = {
+            s: generate_calibrated_gemini_sparkle(s) for s in range(20, 100)
+        }
 
         # 1. Discover authentic camera photographs
         self.image_paths = []
@@ -86,7 +94,28 @@ class RealPhotoWatermarkDataset200k(Dataset if HAS_TORCH else object):
         if len(self.image_paths) == 0:
             raise RuntimeError("CRITICAL: No real camera photographs found! Synthetic generation is strictly prohibited.")
 
-        print(f"✅ RealPhotoWatermarkDataset200k Active: {len(self.image_paths):,} photo pool | {self.total_samples:,} samples/epoch")
+        # 2. High-Speed RAM Pre-loading to eliminate Disk I/O Bottleneck
+        if self.preload_to_ram and len(self.image_paths) > 0:
+            to_cache = self.image_paths[:max_ram_photos]
+            print(f"⚡ Pre-loading up to {len(to_cache):,} real photographs into high-speed RAM cache...")
+            import time
+            t0 = time.time()
+            for p in to_cache:
+                try:
+                    with Image.open(p) as img:
+                        img = img.convert("RGB")
+                        W, H = img.size
+                        S = self.patch_size
+                        if W < S or H < S:
+                            scale = max(S / W, S / H)
+                            img = img.resize((int(W * scale) + 1, int(H * scale) + 1), Image.Resampling.BILINEAR)
+                        self.ram_photos.append(np.array(img, dtype=np.uint8))
+                except Exception:
+                    continue
+            dt = time.time() - t0
+            print(f"🚀 Cached {len(self.ram_photos):,} authentic real photos in RAM in {dt:.1f}s! (Data I/O latency eliminated)")
+
+        print(f"✅ RealPhotoWatermarkDataset200k Active: {len(self.image_paths):,} photo pool | {self.total_samples:,} samples/epoch | RAM Cache: {len(self.ram_photos):,}")
 
     def __len__(self):
         return self.total_samples
@@ -99,32 +128,38 @@ class RealPhotoWatermarkDataset200k(Dataset if HAS_TORCH else object):
         return sparkle
 
     def __getitem__(self, idx):
-        # 1. Select a real photo from pool
-        img_path = self.image_paths[idx % len(self.image_paths)]
-        try:
-            with Image.open(img_path) as img:
-                img = img.convert("RGB")
-                W, H = img.size
-
-                # 2. Extract random square patch
-                S = self.patch_size
-                if W < S or H < S:
-                    scale = max(S / W, S / H)
-                    img = img.resize((int(W * scale) + 1, int(H * scale) + 1), Image.Resampling.BILINEAR)
+        # 1. High-Speed RAM Slice or Fallback to Disk
+        S = self.patch_size
+        if len(self.ram_photos) > 0:
+            img_arr = self.ram_photos[idx % len(self.ram_photos)]
+            H, W, _ = img_arr.shape
+            rx = random.randint(0, max(0, W - S))
+            ry = random.randint(0, max(0, H - S))
+            patch = img_arr[ry:ry+S, rx:rx+S]
+            if random.random() > 0.5:
+                patch = np.ascontiguousarray(np.fliplr(patch))
+            clean = np.ascontiguousarray(patch.astype(np.float32).transpose(2, 0, 1) / 255.0)
+        else:
+            img_path = self.image_paths[idx % len(self.image_paths)]
+            try:
+                with Image.open(img_path) as img:
+                    img = img.convert("RGB")
                     W, H = img.size
+                    if W < S or H < S:
+                        scale = max(S / W, S / H)
+                        img = img.resize((int(W * scale) + 1, int(H * scale) + 1), Image.Resampling.BILINEAR)
+                        W, H = img.size
 
-                rx = random.randint(0, W - S)
-                ry = random.randint(0, H - S)
-                patch = img.crop((rx, ry, rx + S, ry + S))
+                    rx = random.randint(0, W - S)
+                    ry = random.randint(0, H - S)
+                    patch = img.crop((rx, ry, rx + S, ry + S))
 
-                # Photometric real-camera data augmentation
-                if random.random() > 0.5:
-                    patch = patch.transpose(Image.FLIP_LEFT_RIGHT)
+                    if random.random() > 0.5:
+                        patch = patch.transpose(Image.FLIP_LEFT_RIGHT)
 
-                clean = np.array(patch, dtype=np.float32).transpose(2, 0, 1) / 255.0
-
-        except Exception:
-            clean = np.ones((3, self.patch_size, self.patch_size), dtype=np.float32) * 0.5
+                    clean = np.ascontiguousarray(np.array(patch, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+            except Exception:
+                clean = np.ones((3, self.patch_size, self.patch_size), dtype=np.float32) * 0.5
 
         S = self.patch_size
 
