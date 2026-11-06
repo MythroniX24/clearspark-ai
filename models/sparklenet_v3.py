@@ -113,6 +113,48 @@ if HAS_TORCH:
             gate = self.sig(self.conv_g(x))
             return features * gate
 
+    class FastFourierGlobalContextBlock(nn.Module):
+        """
+        Fast Fourier Transform (FFT) Global Context Module (inspired by LaMa).
+        Transforms spatial features into frequency domain via 2D Real FFT (rfft2),
+        applies complex spectral convolution to capture global periodic patterns (edges, lines,
+        repeating textures across the entire image), and transforms back (irfft2).
+        Provides true infinite receptive field without grid dilation artifacts.
+        Guarantees FP32 execution under AMP to maintain cuFFT power-of-two stability.
+        """
+        def __init__(self, channels):
+            super().__init__()
+            self.conv_real = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+            self.conv_imag = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+            self.act = nn.LeakyReLU(0.1, inplace=True)
+            self.norm = nn.BatchNorm2d(channels)
+
+        def forward(self, x):
+            orig_dtype = x.dtype
+            _, _, H, W = x.shape
+            x_f32 = x.float()
+
+            # Execute Fourier spectral processing in FP32 to ensure cuFFT stability
+            # across non-power-of-two dimensions and avoid FP16 overflow/underflow
+            if x.is_cuda and torch.is_autocast_enabled():
+                with torch.cuda.amp.autocast(enabled=False):
+                    fft_feat = torch.fft.rfft2(x_f32, norm='ortho')
+                    real = self.conv_real(fft_feat.real.float()) - self.conv_imag(fft_feat.imag.float())
+                    imag = self.conv_real(fft_feat.imag.float()) + self.conv_imag(fft_feat.real.float())
+                    fft_out = torch.complex(real.float(), imag.float())
+                    spatial_out = torch.fft.irfft2(fft_out, s=(H, W), norm='ortho')
+                    out = x_f32 + self.norm(self.act(spatial_out)) * 0.5
+            else:
+                fft_feat = torch.fft.rfft2(x_f32, norm='ortho')
+                real = self.conv_real(fft_feat.real.float()) - self.conv_imag(fft_feat.imag.float())
+                imag = self.conv_real(fft_feat.imag.float()) + self.conv_imag(fft_feat.real.float())
+                fft_out = torch.complex(real.float(), imag.float())
+                spatial_out = torch.fft.irfft2(fft_out, s=(H, W), norm='ortho')
+                out = x_f32 + self.norm(self.act(spatial_out)) * 0.5
+
+            return out.to(dtype=orig_dtype)
+
+
     class ResidualDenseBlock(nn.Module):
         """Residual Dense Block for continuous texture and gradient feature propagation."""
         def __init__(self, in_channels, growth_rate=16):
@@ -240,8 +282,9 @@ if HAS_TORCH:
             self.dilated2 = GatedConv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=1, padding=4, dilation=4)
             self.dilated3 = GatedConv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=1, padding=8, dilation=8)
 
-            # High-Frequency Texture Synthesis Block
+            # High-Frequency Texture & Infinite Context Synthesis Blocks
             self.rdb = ResidualDenseBlock(base_channels * 2, growth_rate=16)
+            self.ffc = FastFourierGlobalContextBlock(base_channels * 2)
 
             # Output Refinement & Luminance Balancing
             self.gate3 = GatedConv2d(base_channels * 2, base_channels, kernel_size=3, stride=1, padding=1)
@@ -267,17 +310,18 @@ if HAS_TORCH:
             d3 = self.dilated3(d2)
 
             r = self.rdb(d3)
+            f = self.ffc(r)
 
-            h3 = self.gate3(r + h2)
+            h3 = self.gate3(f + h2)
             raw_synth = torch.sigmoid(self.out_conv(h3))
 
-            # ── Contextual Luminance Matching (Anti-Darkening Calibration) ───
-            # Compute mean and std of unmasked boundary collar ring
+            # ── 1. Contextual Luminance Matching (Anti-Darkening Calibration) ───
             collar_mask = (1.0 - mask)
             collar_area = torch.clamp(collar_mask.sum(dim=(2, 3), keepdim=True), min=1.0)
             collar_mean = (img * collar_mask).sum(dim=(2, 3), keepdim=True) / collar_area
+            collar_var = ((img - collar_mean) ** 2 * collar_mask).sum(dim=(2, 3), keepdim=True) / collar_area
+            collar_std = torch.sqrt(torch.clamp(collar_var, min=1e-5, max=0.08))
 
-            # Patch mask
             hole_area = torch.clamp(mask.sum(dim=(2, 3), keepdim=True), min=1.0)
             synth_mean = (raw_synth * mask).sum(dim=(2, 3), keepdim=True) / hole_area
 
@@ -285,8 +329,14 @@ if HAS_TORCH:
             luma_offset = torch.clamp(collar_mean - synth_mean, -0.15, 0.25)
             calibrated_synth = torch.clamp(raw_synth + luma_offset * mask, 0.0, 1.0)
 
-            # Composite output
-            inpainted = img * (1.0 - mask) + calibrated_synth * mask
+            # ── 2. Photometric Sensor Grain Injection (Anti-Plastic Realism) ────
+            if self.training:
+                grain = torch.randn_like(calibrated_synth) * collar_std * 0.20
+                calibrated_synth = torch.clamp(calibrated_synth + grain * mask, 0.0, 1.0)
+
+            # ── 3. Multi-Band Boundary Feathering (Zero-Seam Undetectable Blending)
+            smooth_mask = F.avg_pool2d(F.pad(mask, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
+            inpainted = img * (1.0 - smooth_mask) + calibrated_synth * smooth_mask
             return inpainted, calibrated_synth
 
 
@@ -326,6 +376,14 @@ if HAS_TORCH:
                 export_layer(module.ca.mlp[0], f"{prefix}.ca.fc1", dest)
                 export_layer(module.ca.mlp[2], f"{prefix}.ca.fc2", dest)
                 export_layer(module.sa.conv, f"{prefix}.sa.conv", dest)
+            elif isinstance(module, nn.BatchNorm2d):
+                W = module.weight.detach().cpu().numpy() if module.weight is not None else np.ones(module.num_features, dtype=np.float32)
+                b = module.bias.detach().cpu().numpy() if module.bias is not None else np.zeros(module.num_features, dtype=np.float32)
+                dest[prefix] = {
+                    'shape': list(W.shape),
+                    'data': [float(np.round(x, 5)) for x in W.flatten()],
+                    'bias': [float(np.round(x, 5)) for x in b.flatten()]
+                }
 
         # Export WAL-Net v3
         export_layer(raw_wal.stem, 'stem', bundle['wal_net'])
@@ -350,6 +408,11 @@ if HAS_TORCH:
         export_layer(raw_cis.dilated2, 'dilated2', bundle['cis_net'])
         export_layer(raw_cis.dilated3, 'dilated3', bundle['cis_net'])
         export_layer(raw_cis.rdb, 'rdb', bundle['cis_net'])
+        if hasattr(raw_cis, 'ffc'):
+            export_layer(raw_cis.ffc.conv_real, 'ffc.conv_real', bundle['cis_net'])
+            export_layer(raw_cis.ffc.conv_imag, 'ffc.conv_imag', bundle['cis_net'])
+            if hasattr(raw_cis.ffc, 'norm') and isinstance(raw_cis.ffc.norm, nn.BatchNorm2d):
+                export_layer(raw_cis.ffc.norm, 'ffc.norm', bundle['cis_net'])
         export_layer(raw_cis.gate3, 'gate3', bundle['cis_net'])
         export_layer(raw_cis.out_conv, 'out_conv', bundle['cis_net'])
 
@@ -365,6 +428,9 @@ if HAS_TORCH:
             bundle['template_48'] = generate_calibrated_gemini_sparkle(48).tolist()
             bundle['template_96'] = generate_calibrated_gemini_sparkle(96).tolist()
 
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         with open(out_path, 'w') as f:
             json.dump(bundle, f)
         print(f"✅ Exported SparkleNet v3.0 Ultra weights: {out_path} ({os.path.getsize(out_path)/1024:.1f} KB)")

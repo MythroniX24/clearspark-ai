@@ -61,12 +61,15 @@ if HAS_TORCH:
             pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
             target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
 
-            p_dx = F.conv2d(pred_gray, self.kx, padding=1)
-            p_dy = F.conv2d(pred_gray, self.ky, padding=1)
+            kx = self.kx.to(device=pred.device, dtype=pred_gray.dtype)
+            ky = self.ky.to(device=pred.device, dtype=pred_gray.dtype)
+
+            p_dx = F.conv2d(pred_gray, kx, padding=1)
+            p_dy = F.conv2d(pred_gray, ky, padding=1)
             p_mag = torch.sqrt(p_dx ** 2 + p_dy ** 2 + 1e-6)
 
-            t_dx = F.conv2d(target_gray, self.kx, padding=1)
-            t_dy = F.conv2d(target_gray, self.ky, padding=1)
+            t_dx = F.conv2d(target_gray, kx, padding=1)
+            t_dy = F.conv2d(target_gray, ky, padding=1)
             t_mag = torch.sqrt(t_dx ** 2 + t_dy ** 2 + 1e-6)
 
             return F.l1_loss(p_mag, t_mag)
@@ -95,6 +98,90 @@ if HAS_TORCH:
 
             return loss_anti_dark + loss_luma * 1.5
 
+    class SSIMLoss(nn.Module):
+        """Structural Similarity (SSIM) Loss to eliminate plastic/blur artifacts with AMP FP16 stability."""
+        def __init__(self, window_size=11, channels=3):
+            super().__init__()
+            self.window_size = window_size
+            self.channels = channels
+            sigma = 1.5
+            gauss = torch.tensor([math.exp(-(x - window_size//2)**2 / (2 * sigma**2)) for x in range(window_size)])
+            gauss = gauss / gauss.sum()
+            _1d_window = gauss.unsqueeze(1)
+            _2d_window = _1d_window.mm(_1d_window.t()).float().unsqueeze(0).unsqueeze(0)
+            window = _2d_window.expand(channels, 1, window_size, window_size).contiguous()
+            self.register_buffer('window', window)
+
+        def forward(self, img1, img2):
+            orig_dtype = img1.dtype
+            # Compute in FP32 to prevent FP16 subnormal underflow and variance round-off errors
+            img1_f = img1.float()
+            img2_f = img2.float()
+            win = self.window.float()
+
+            mu1 = F.conv2d(img1_f, win, padding=self.window_size//2, groups=self.channels)
+            mu2 = F.conv2d(img2_f, win, padding=self.window_size//2, groups=self.channels)
+            mu1_sq = mu1.pow(2)
+            mu2_sq = mu2.pow(2)
+            mu1_mu2 = mu1 * mu2
+
+            # Clamp variance to >= 0.0 to avoid negative variance from precision round-off
+            sigma1_sq = torch.clamp(F.conv2d(img1_f * img1_f, win, padding=self.window_size//2, groups=self.channels) - mu1_sq, min=0.0)
+            sigma2_sq = torch.clamp(F.conv2d(img2_f * img2_f, win, padding=self.window_size//2, groups=self.channels) - mu2_sq, min=0.0)
+            sigma12 = F.conv2d(img1_f * img2_f, win, padding=self.window_size//2, groups=self.channels) - mu1_mu2
+
+            C1, C2 = 0.01 ** 2, 0.03 ** 2
+            numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+            denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-6
+            ssim_map = numerator / denominator
+            loss = 1.0 - ssim_map.mean()
+            return loss.to(dtype=orig_dtype)
+
+
+    class BoundaryGradientLoss(nn.Module):
+        """Enforces zero visible seam / border line at the inpainting perimeter across all RGB channels."""
+        def __init__(self):
+            super().__init__()
+            kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+            ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+            self.register_buffer('kx', kx)
+            self.register_buffer('ky', ky)
+
+        def forward(self, pred, target, mask):
+            # Compute luminance gradients across all RGB channels for full-color seam detection
+            pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
+            target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
+
+            dilated = F.max_pool2d(F.pad(mask, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
+            seam_band = (dilated - mask).clamp(0.0, 1.0)
+            seam_area = torch.clamp(seam_band.sum(), min=1.0)
+
+            kx = self.kx.to(device=pred.device, dtype=pred_gray.dtype)
+            ky = self.ky.to(device=pred.device, dtype=pred_gray.dtype)
+
+            p_dx = F.conv2d(pred_gray, kx, padding=1)
+            t_dx = F.conv2d(target_gray, kx, padding=1)
+            p_dy = F.conv2d(pred_gray, ky, padding=1)
+            t_dy = F.conv2d(target_gray, ky, padding=1)
+
+            # Normalize by perimeter seam area for scale invariance while keeping autograd graph connected
+            loss_dx = (torch.abs(p_dx - t_dx) * seam_band).sum() / seam_area
+            loss_dy = (torch.abs(p_dy - t_dy) * seam_band).sum() / seam_area
+            return loss_dx + loss_dy
+
+
+    class ColorHarmonyLoss(nn.Module):
+        """Guarantees matching color hue and saturation across the inpainting boundary."""
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, pred, target, mask):
+            p_norm = F.normalize(pred + 1e-4, p=2, dim=1)
+            t_norm = F.normalize(target + 1e-4, p=2, dim=1)
+            # Clamp cosine similarity to [-1.0, 1.0] to prevent numerical overflow above 1.0
+            cosine_sim = torch.clamp((p_norm * t_norm).sum(dim=1, keepdim=True), -1.0, 1.0)
+            return ((1.0 - cosine_sim) * mask).sum() / torch.clamp(mask.sum(), min=1.0)
+
 else:
     class SobelLoss(object):
         def __init__(self, *args, **kwargs):
@@ -103,6 +190,18 @@ else:
     class LuminanceAndAntiDarkLoss(object):
         def __init__(self, *args, **kwargs):
             raise RuntimeError("LuminanceAndAntiDarkLoss requires PyTorch. Please install torch or run on Kaggle/Colab GPU.")
+
+    class SSIMLoss(object):
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("SSIMLoss requires PyTorch. Please install torch or run on Kaggle/Colab GPU.")
+
+    class BoundaryGradientLoss(object):
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("BoundaryGradientLoss requires PyTorch. Please install torch or run on Kaggle/Colab GPU.")
+
+    class ColorHarmonyLoss(object):
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("ColorHarmonyLoss requires PyTorch. Please install torch or run on Kaggle/Colab GPU.")
 
 
 # ── Distributed & Hardware Acceleration Setup ────────────────────────────────
@@ -209,6 +308,9 @@ def train_sparklenet_v3_200k(
     l1_fn = nn.L1Loss()
     sobel_fn = SobelLoss().to(device)
     luma_dark_fn = LuminanceAndAntiDarkLoss().to(device)
+    ssim_fn = SSIMLoss().to(device)
+    boundary_fn = BoundaryGradientLoss().to(device)
+    color_fn = ColorHarmonyLoss().to(device)
 
     all_params = list(wal_net.parameters()) + list(cis_net.parameters())
     optimizer = torch.optim.AdamW(all_params, lr=lr, betas=(0.9, 0.999), weight_decay=1e-4)
@@ -265,8 +367,11 @@ def train_sparklenet_v3_200k(
                 loss_l1 = l1_fn(inpainted, clean_img)
                 loss_dark_luma = luma_dark_fn(inpainted, clean_img, train_mask)
                 loss_sobel = sobel_fn(inpainted, clean_img) * 0.25
+                loss_ssim = ssim_fn(inpainted, clean_img) * 0.30
+                loss_boundary = boundary_fn(inpainted, clean_img, train_mask) * 0.20
+                loss_color = color_fn(inpainted, clean_img, train_mask) * 0.20
 
-                loss_cis = loss_l1 + loss_dark_luma + loss_sobel
+                loss_cis = loss_l1 + loss_dark_luma + loss_sobel + loss_ssim + loss_boundary + loss_color
                 total_loss = loss_wal + loss_cis
 
             scaler.scale(total_loss).backward()
