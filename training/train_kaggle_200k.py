@@ -61,15 +61,15 @@ if HAS_TORCH:
             pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
             target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
 
-            kx = self.kx.to(device=pred.device, dtype=pred_gray.dtype)
-            ky = self.ky.to(device=pred.device, dtype=pred_gray.dtype)
+            kx = self.kx.to(device=pred.device, dtype=pred_gray.dtype).contiguous()
+            ky = self.ky.to(device=pred.device, dtype=pred_gray.dtype).contiguous()
 
-            p_dx = F.conv2d(pred_gray, kx, padding=1)
-            p_dy = F.conv2d(pred_gray, ky, padding=1)
+            p_dx = F.conv2d(pred_gray.contiguous(), kx, padding=1)
+            p_dy = F.conv2d(pred_gray.contiguous(), ky, padding=1)
             p_mag = torch.sqrt(p_dx ** 2 + p_dy ** 2 + 1e-6)
 
-            t_dx = F.conv2d(target_gray, kx, padding=1)
-            t_dy = F.conv2d(target_gray, ky, padding=1)
+            t_dx = F.conv2d(target_gray.contiguous(), kx, padding=1)
+            t_dy = F.conv2d(target_gray.contiguous(), ky, padding=1)
             t_mag = torch.sqrt(t_dx ** 2 + t_dy ** 2 + 1e-6)
 
             return F.l1_loss(p_mag, t_mag)
@@ -115,9 +115,9 @@ if HAS_TORCH:
         def forward(self, img1, img2):
             orig_dtype = img1.dtype
             # Compute in FP32 to prevent FP16 subnormal underflow and variance round-off errors
-            img1_f = img1.float()
-            img2_f = img2.float()
-            win = self.window.float()
+            img1_f = img1.contiguous().float()
+            img2_f = img2.contiguous().float()
+            win = self.window.to(device=img1.device, dtype=torch.float32).contiguous()
 
             mu1 = F.conv2d(img1_f, win, padding=self.window_size//2, groups=self.channels)
             mu2 = F.conv2d(img2_f, win, padding=self.window_size//2, groups=self.channels)
@@ -149,15 +149,15 @@ if HAS_TORCH:
 
         def forward(self, pred, target, mask):
             # Compute luminance gradients across all RGB channels for full-color seam detection
-            pred_gray = 0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]
-            target_gray = 0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]
+            pred_gray = (0.299 * pred[:, 0:1] + 0.587 * pred[:, 1:2] + 0.114 * pred[:, 2:3]).contiguous()
+            target_gray = (0.299 * target[:, 0:1] + 0.587 * target[:, 1:2] + 0.114 * target[:, 2:3]).contiguous()
 
-            dilated = F.max_pool2d(F.pad(mask, (1, 1, 1, 1), mode='replicate'), 3, stride=1)
-            seam_band = (dilated - mask).clamp(0.0, 1.0)
+            dilated = F.max_pool2d(F.pad(mask.contiguous(), (1, 1, 1, 1), mode='replicate'), 3, stride=1).contiguous()
+            seam_band = (dilated - mask.contiguous()).clamp(0.0, 1.0).contiguous()
             seam_area = torch.clamp(seam_band.sum(), min=1.0)
 
-            kx = self.kx.to(device=pred.device, dtype=pred_gray.dtype)
-            ky = self.ky.to(device=pred.device, dtype=pred_gray.dtype)
+            kx = self.kx.to(device=pred.device, dtype=pred_gray.dtype).contiguous()
+            ky = self.ky.to(device=pred.device, dtype=pred_gray.dtype).contiguous()
 
             p_dx = F.conv2d(pred_gray, kx, padding=1)
             t_dx = F.conv2d(target_gray, kx, padding=1)
@@ -261,14 +261,14 @@ def train_sparklenet_v3_200k(
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
                 print(f"   ⚡ GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB VRAM) | Active on: cuda:{local_rank if is_ddp else i}")
-            print("🚀 cuDNN Benchmark & Channels-Last Memory Format: ACTIVE")
+            print("🚀 cuDNN Benchmark & Hardware Acceleration: ACTIVE")
 
-    # 1. Models & Channels-Last Tensor Core Optimization
+    # 1. Models & Hardware Optimization
     wal_net = MultiScaleAttentionUNet_v3(in_channels=3, base_channels=16)
     cis_net = UltraContextualInpainter_v3(in_channels=4, base_channels=16)
 
-    wal_net = wal_net.to(device, memory_format=torch.channels_last)
-    cis_net = cis_net.to(device, memory_format=torch.channels_last)
+    wal_net = wal_net.to(device)
+    cis_net = cis_net.to(device)
 
     if is_ddp:
         wal_net = nn.parallel.DistributedDataParallel(wal_net, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
@@ -279,7 +279,7 @@ def train_sparklenet_v3_200k(
         wal_net = nn.DataParallel(wal_net)
         cis_net = nn.DataParallel(cis_net)
         if is_master:
-            print("⚡ Multi-GPU DataParallel Active!")
+            print("⚡ Multi-GPU DataParallel Active across all available GPUs!")
 
     # 2. Dataset & Optimized DataLoader with High-Speed RAM Cache
     dataset = RealPhotoWatermarkDataset200k(
@@ -337,12 +337,12 @@ def train_sparklenet_v3_200k(
         epoch_start = time.time()
 
         for step, (wm_img, clean_img, gt_mask, gt_box, gt_conf) in enumerate(dataloader):
-            # Asynchronous DMA transfer with Channels-Last format
-            wm_img = wm_img.to(device, memory_format=torch.channels_last, non_blocking=True)
-            clean_img = clean_img.to(device, memory_format=torch.channels_last, non_blocking=True)
-            gt_mask = gt_mask.to(device, non_blocking=True)
-            gt_box = gt_box.to(device, non_blocking=True)
-            gt_conf = gt_conf.to(device, non_blocking=True)
+            # Asynchronous DMA transfer with Contiguous 16-byte memory alignment
+            wm_img = wm_img.to(device, non_blocking=True).contiguous()
+            clean_img = clean_img.to(device, non_blocking=True).contiguous()
+            gt_mask = gt_mask.to(device, non_blocking=True).contiguous()
+            gt_box = gt_box.to(device, non_blocking=True).contiguous()
+            gt_conf = gt_conf.to(device, non_blocking=True).contiguous()
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -357,9 +357,9 @@ def train_sparklenet_v3_200k(
                 loss_wal = loss_mask * 2.0 + loss_box + loss_conf * 0.5
 
                 # CIS-Net v3 Ultra Forward with sample-level scheduled sampling
-                pred_mask = (wal_out['mask'].detach() > 0.35).float()
+                pred_mask = (wal_out['mask'].detach() > 0.35).float().contiguous()
                 use_pred = (torch.rand((wm_img.size(0), 1, 1, 1), device=device) > 0.5)
-                train_mask = torch.where(use_pred, pred_mask, gt_mask)
+                train_mask = torch.where(use_pred, pred_mask, gt_mask).contiguous()
 
                 inpainted, synth_patch = cis_net(wm_img, train_mask)
 

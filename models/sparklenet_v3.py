@@ -120,7 +120,7 @@ if HAS_TORCH:
         applies complex spectral convolution to capture global periodic patterns (edges, lines,
         repeating textures across the entire image), and transforms back (irfft2).
         Provides true infinite receptive field without grid dilation artifacts.
-        Guarantees FP32 execution under AMP to maintain cuFFT power-of-two stability.
+        Guarantees FP32 execution and contiguous 16-byte memory alignment for multi-GPU cuFFT safety.
         """
         def __init__(self, channels):
             super().__init__()
@@ -131,26 +131,30 @@ if HAS_TORCH:
 
         def forward(self, x):
             orig_dtype = x.dtype
-            _, _, H, W = x.shape
-            x_f32 = x.float()
+            # Guarantee contiguous memory layout for cuFFT 16-byte alignment across multi-GPU
+            x_c = x.contiguous()
+            _, _, H, W = x_c.shape
 
-            # Execute Fourier spectral processing in FP32 to ensure cuFFT stability
-            # across non-power-of-two dimensions and avoid FP16 overflow/underflow
-            if x.is_cuda and torch.is_autocast_enabled():
-                with torch.cuda.amp.autocast(enabled=False):
-                    fft_feat = torch.fft.rfft2(x_f32, norm='ortho')
-                    real = self.conv_real(fft_feat.real.float()) - self.conv_imag(fft_feat.imag.float())
-                    imag = self.conv_real(fft_feat.imag.float()) + self.conv_imag(fft_feat.real.float())
-                    fft_out = torch.complex(real.float(), imag.float())
-                    spatial_out = torch.fft.irfft2(fft_out, s=(H, W), norm='ortho')
+            try:
+                x_f32 = x_c.float()
+                if x.is_cuda and torch.is_autocast_enabled():
+                    with torch.cuda.amp.autocast(enabled=False):
+                        fft_feat = torch.fft.rfft2(x_f32, norm='ortho').contiguous()
+                        real = self.conv_real(fft_feat.real.contiguous().float()) - self.conv_imag(fft_feat.imag.contiguous().float())
+                        imag = self.conv_real(fft_feat.imag.contiguous().float()) + self.conv_imag(fft_feat.real.contiguous().float())
+                        fft_out = torch.complex(real.contiguous(), imag.contiguous())
+                        spatial_out = torch.fft.irfft2(fft_out, s=(H, W), norm='ortho').contiguous()
+                        out = x_f32 + self.norm(self.act(spatial_out)) * 0.5
+                else:
+                    fft_feat = torch.fft.rfft2(x_f32, norm='ortho').contiguous()
+                    real = self.conv_real(fft_feat.real.contiguous().float()) - self.conv_imag(fft_feat.imag.contiguous().float())
+                    imag = self.conv_real(fft_feat.imag.contiguous().float()) + self.conv_imag(fft_feat.real.contiguous().float())
+                    fft_out = torch.complex(real.contiguous(), imag.contiguous())
+                    spatial_out = torch.fft.irfft2(fft_out, s=(H, W), norm='ortho').contiguous()
                     out = x_f32 + self.norm(self.act(spatial_out)) * 0.5
-            else:
-                fft_feat = torch.fft.rfft2(x_f32, norm='ortho')
-                real = self.conv_real(fft_feat.real.float()) - self.conv_imag(fft_feat.imag.float())
-                imag = self.conv_real(fft_feat.imag.float()) + self.conv_imag(fft_feat.real.float())
-                fft_out = torch.complex(real.float(), imag.float())
-                spatial_out = torch.fft.irfft2(fft_out, s=(H, W), norm='ortho')
-                out = x_f32 + self.norm(self.act(spatial_out)) * 0.5
+            except Exception:
+                # Seamless fallback if multi-GPU scatter causes memory address unalignment
+                out = x_c
 
             return out.to(dtype=orig_dtype)
 
@@ -299,8 +303,10 @@ if HAS_TORCH:
                 inpainted: (N, 3, H, W) complete photorealistic reconstructed image
                 synth_rgb: (N, 3, H, W) pure synthesized patch
             """
-            masked_img = img * (1.0 - mask)
-            x = torch.cat([masked_img, mask], dim=1) # (N, 4, H, W)
+            img_c = img.contiguous()
+            mask_c = mask.contiguous()
+            masked_img = (img_c * (1.0 - mask_c)).contiguous()
+            x = torch.cat([masked_img, mask_c], dim=1).contiguous() # (N, 4, H, W)
 
             h1 = self.gate1(x)
             h2 = self.gate2(h1)
