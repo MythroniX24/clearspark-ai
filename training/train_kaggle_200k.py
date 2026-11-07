@@ -246,7 +246,7 @@ def train_sparklenet_v3_200k(
     samples_per_epoch=200000,
     lr=1.5e-3,
     output_weights="sparklenet_web_weights.json",
-    num_workers=2,
+    num_workers=0,
     patch_size=128
 ):
     if not HAS_TORCH:
@@ -256,12 +256,12 @@ def train_sparklenet_v3_200k(
     is_master = (rank == 0)
 
     if is_master:
-        print(f"🔥 PyTorch Active: {torch.__version__} | Mode: {'DDP (DistributedDataParallel)' if is_ddp else 'Single/DP'} | World Size: {world_size}")
+        print(f"🔥 PyTorch Active: {torch.__version__} | Mode: {'DDP (DistributedDataParallel)' if is_ddp else 'Single/DP'} | World Size: {world_size}", flush=True)
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
-                print(f"   ⚡ GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB VRAM) | Active on: cuda:{local_rank if is_ddp else i}")
-            print("🚀 cuDNN Benchmark & Hardware Acceleration: ACTIVE")
+                print(f"   ⚡ GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB VRAM) | Active on: cuda:{local_rank if is_ddp else i}", flush=True)
+            print("🚀 cuDNN Benchmark & Hardware Acceleration: ACTIVE", flush=True)
 
     # 1. Models & Hardware Optimization
     wal_net = MultiScaleAttentionUNet_v3(in_channels=3, base_channels=16)
@@ -274,12 +274,15 @@ def train_sparklenet_v3_200k(
         wal_net = nn.parallel.DistributedDataParallel(wal_net, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
         cis_net = nn.parallel.DistributedDataParallel(cis_net, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
         if is_master:
-            print("⚡ Dual T4 DDP Active (100% Symmetrical GPU Load, Zero GIL Bottleneck)!")
+            print("⚡ Dual T4 DDP Active (100% Symmetrical GPU Load, Zero GIL Bottleneck)!", flush=True)
     elif torch.cuda.device_count() > 1:
         wal_net = nn.DataParallel(wal_net)
         cis_net = nn.DataParallel(cis_net)
         if is_master:
-            print("⚡ Multi-GPU DataParallel Active across all available GPUs!")
+            print(f"⚡ Multi-GPU DataParallel Active across all {torch.cuda.device_count()} available GPUs (Batch: {batch_size})!", flush=True)
+    else:
+        if is_master:
+            print(f"⚡ Single GPU Hardware Acceleration Active on {device} (Batch: {batch_size})!", flush=True)
 
     # 2. Dataset & Optimized DataLoader with High-Speed RAM Cache
     dataset = RealPhotoWatermarkDataset200k(
@@ -295,10 +298,8 @@ def train_sparklenet_v3_200k(
         batch_size=batch_size,
         sampler=sampler,
         shuffle=(sampler is None),
-        num_workers=num_workers if torch.cuda.is_available() else 0,
+        num_workers=0,  # 0 eliminates CUDA fork deadlock in Jupyter/Kaggle; RAM caching streams >300 samples/s directly
         pin_memory=(torch.cuda.is_available()),
-        persistent_workers=(num_workers > 0 and torch.cuda.is_available()),
-        prefetch_factor=2 if num_workers > 0 else None,
         drop_last=True
     )
 
@@ -385,17 +386,17 @@ def train_sparklenet_v3_200k(
             ep_wal.append(loss_wal.item())
             ep_cis.append(loss_cis.item())
 
-            if is_master and ((step + 1) % 50 == 0 or (step + 1) == len(dataloader)):
+            if is_master and (step == 0 or (step + 1) % 25 == 0 or (step + 1) == len(dataloader)):
                 step_elapsed = time.time() - epoch_start
                 samples_processed = (step + 1) * global_batch_size
                 throughput = samples_processed / max(0.01, step_elapsed)
                 print(f"[Epoch {epoch:02d}/{epochs:02d} | Step {step+1:04d}/{len(dataloader):04d}] "
                       f"Loss: {total_loss.item():.4f} (WAL: {loss_wal.item():.4f}, CIS: {loss_cis.item():.4f}) | "
-                      f"⚡ {throughput:.0f} samples/s | Elapsed: {step_elapsed/60.0:.1f}m")
+                      f"⚡ {throughput:.0f} samples/s | Elapsed: {step_elapsed/60.0:.1f}m", flush=True)
 
         if is_master:
             epoch_time = (time.time() - epoch_start) / 60.0
-            print(f"📊 >>> Epoch {epoch} Complete in {epoch_time:.1f}m. Average Loss: {np.mean(ep_losses):.4f}")
+            print(f"📊 >>> Epoch {epoch} Complete in {epoch_time:.1f}m. Average Loss: {np.mean(ep_losses):.4f}", flush=True)
 
     if is_master:
         total_time = (time.time() - start_time) / 60.0
@@ -420,7 +421,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size per GPU")
     parser.add_argument("--samples", type=int, default=200000, help="Samples per epoch")
     parser.add_argument("--lr", type=float, default=1.5e-3, help="Learning rate")
-    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers per process")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers per process (default 0 for RAM caching)")
     parser.add_argument("--patch_size", type=int, default=128, help="Cropped patch size")
     parser.add_argument("--output_weights", type=str, default="sparklenet_web_weights.json", help="Output weights file")
     return parser.parse_args()
